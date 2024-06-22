@@ -1,75 +1,130 @@
-# подключаем библиотеку компьютерного зрения
+import tkinter as tk
+from tkinter import filedialog
 import cv2
+from PIL import Image, ImageTk
+import threading
+import time
 from fer import FER
-import dict
 
-emo_detector = FER(mtcnn=False)
-# функция определения лиц
-def highlightFace(net, frame, conf_threshold=0.95):
-    # делаем копию текущего кадра
-    frameOpencvDnn=frame.copy()
-    # высота и ширина кадра
-    frameHeight=frameOpencvDnn.shape[0]
-    frameWidth=frameOpencvDnn.shape[1]
-    # преобразуем картинку в двоичный пиксельный объект
-    blob=cv2.dnn.blobFromImage(frameOpencvDnn, 1.0, (300, 300), [104, 117, 123], True, False)
-    # устанавливаем этот объект как входной параметр для нейросети
-    net.setInput(blob)
-    # выводим обработанное изображение с эмоциями и саму эмоцию в консоль
-    dominant_emotion, emotion_score = emo_detector.top_emotion(frameOpencvDnn)
-    print(dict.emotions_dict.get(dominant_emotion), emotion_score)
-    # выполняем прямой проход для распознавания лиц
-    detections=net.forward()
-    # переменная для рамок вокруг лица
-    faceBoxes=[]
-    # перебираем все блоки после распознавания
-    for i in range(detections.shape[2]):
-        # получаем результат вычислений для очередного элемента
-        confidence=detections[0,0,i,2]
-        # если результат превышает порог срабатывания — это лицо
-        if confidence>conf_threshold:
-            # формируем координаты рамки
-            x1=int(detections[0,0,i,3]*frameWidth)
-            y1=int(detections[0,0,i,4]*frameHeight)
-            x2=int(detections[0,0,i,5]*frameWidth)
-            y2=int(detections[0,0,i,6]*frameHeight)
-            # добавляем их в общую переменную
-            faceBoxes.append([x1,y1,x2,y2])
-            # рисуем рамку на кадре
-            color = (255, 255, 255, 255)
-            cv2.rectangle(frameOpencvDnn, (x1,y1), (x2,y2), (0,255,0), int(round(frameHeight/150)), 8)
-            # выводим информацию по эмоции
+class FaceDetectionGUI:
+    def __init__(self, master):
+        self.master = master
+        master.title("Детектор лиц и эмоций")
 
-            cv2.putText(frameOpencvDnn, f"{str(emotion_score)} {dominant_emotion}",
-                        (x1, y1-15),
-                        cv2.FONT_ITALIC, 0.5, color, 1, cv2.LINE_AA, )
-    # возвращаем кадр с рамками
-    return frameOpencvDnn,faceBoxes
+        # Создаем элементы управления
+        self.video_label = tk.Label(master)
+        self.video_label.pack()
 
-# загружаем веса для распознавания лиц
-faceProto="opencv_face_detector.pbtxt"
-# и конфигурацию самой нейросети — слои и связи нейронов
-faceModel="opencv_face_detector_uint8.pb"
+        self.result_label = tk.Label(master, text="")
+        self.result_label.pack()
 
-# запускаем нейросеть по распознаванию лиц
-faceNet=cv2.dnn.readNet(faceModel,faceProto)
+        self.emotions_text = tk.Text(master, height=10, width=30)
+        self.emotions_text.pack()
 
-# получаем видео с камеры
-video=cv2.VideoCapture(0)
-# пока не нажата любая клавиша — выполняем цикл
-while cv2.waitKey(1)<0:
-    # получаем очередной кадр с камеры
-    hasFrame,frame=video.read()
-    # если кадра нет
-    if not hasFrame:
-        # останавливаемся и выходим из цикла
-        cv2.waitKey()
-        break
-    # распознаём лица в кадре
-    resultImg,faceBoxes=highlightFace(faceNet,frame)
-    # если лиц нет
-    if not faceBoxes:
-        # выводим в консоли, что лицо не найдено
-        print("Лица не распознаны")
-    # выводим картинку с камеры
-    cv2.imshow("Face detection", resultImg)
+        # Загружаем классификатор для распознавания лиц
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+        # Создаем объект FER для распознавания эмоций
+        self.emo_detector = FER(mtcnn=True)
+
+        # Запускаем поток для обработки видео
+        self.video_thread = threading.Thread(target=self.process_video)
+        self.video_thread.start()
+
+        # Время последнего обновления эмоций
+        self.last_update_time = time.time()
+
+    def process_video(self):
+        # Открываем камеру
+        cap = cv2.VideoCapture(0)
+
+        while True:
+            # Захватываем кадр с камеры
+            ret, frame = cap.read()
+
+            if ret:
+                # Корректируем баланс белого
+                frame = self.adjust_white_balance(frame)
+
+                # Обнаруживаем лица и эмоции на кадре
+                faces, emotions = self.detect_faces_and_emotions(frame)
+
+                # Проверяем, прошло ли достаточно времени для обновления эмоций
+                current_time = time.time()
+                if current_time - self.last_update_time >= 1:  # Обновляем эмоции каждую секунду
+                    self.update_gui(frame, len(faces), emotions)
+                    self.last_update_time = current_time
+
+            # Задержка для ограничения частоты кадров
+            cv2.waitKey(30)
+
+        cap.release()
+
+    def adjust_white_balance(self, frame):
+        # Конвертируем изображение в цветовое пространство LAB
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+
+        # Разделяем каналы LAB
+        l, a, b = cv2.split(lab)
+
+        # Вычисляем среднее значение для канала L
+        l_mean = cv2.mean(l)[0]
+
+        # Вычисляем коэффициенты усиления для каналов A и B
+        a_gain = 128.0 / l_mean
+        b_gain = 128.0 / l_mean
+
+        # Применяем коэффициенты усиления к каналам A и B
+        a = cv2.multiply(a, a_gain)
+        b = cv2.multiply(b, b_gain)
+
+        # Объединяем каналы LAB обратно
+        lab = cv2.merge((l, a, b))
+
+        # Конвертируем изображение обратно в цветовое пространство BGR
+        frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        return frame
+
+    def detect_faces_and_emotions(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        emotions = []
+
+        for (x, y, w, h) in faces:
+            roi_color = frame[y:y + h, x:x + w]
+            dominant_emotion, emotion_score = self.emo_detector.top_emotion(roi_color)
+            emotions.append(self.get_emotion_text(dominant_emotion))
+
+        return faces, emotions
+
+    def get_emotion_text(self, emotion):
+        emotions = {
+            'angry': 'злость',
+            'disgust': 'отвращение',
+            'fear': 'страх',
+            'happy': 'радость',
+            'sad': 'грусть',
+            'surprise': 'удивление',
+            'neutral': 'нейтральное'
+        }
+        return emotions.get(emotion, 'неизвестно')
+
+    def update_gui(self, frame, num_faces, emotions):
+        # Конвертируем изображение в формат, подходящий для Tkinter
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(image)
+        image = ImageTk.PhotoImage(image)
+
+        # Обновляем элементы управления
+        self.video_label.configure(image=image)
+        self.video_label.image = image
+        self.result_label.config(text=f"Найдено {num_faces} лиц")
+        self.emotions_text.delete('1.0', tk.END)  # Очищаем текстовое поле
+        for i, emotion in enumerate(emotions, start=1):
+            self.emotions_text.insert(tk.END, f"Лицо {i}: {emotion}\n")
+
+
+root = tk.Tk()
+gui = FaceDetectionGUI(root)
+root.mainloop()
